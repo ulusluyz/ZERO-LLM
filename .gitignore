@@ -3,3 +3,9 @@ __pycache__/
 .pytest_cache/
 checkpoints/
 *.pt
+
+.venv/
+*.pt.sha256
+.checkpoint-*.tmp
+.tokens-*/
+.training.lock

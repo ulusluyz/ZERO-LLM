@@ -19,9 +19,13 @@ class TransformerBlock(nn.Module):
             dropout=config.dropout,
         )
 
-    def forward(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, start_pos: int = 0, kv_cache=None, use_cache=False):
         # Pre-Norm Causal Attention with Residual Connection
-        h = x + self.attention(self.input_layernorm(x), start_pos=start_pos)
+        attention = self.attention(self.input_layernorm(x), start_pos=start_pos,
+                                   kv_cache=kv_cache, use_cache=use_cache)
+        if use_cache:
+            attention, cache = attention
+        h = x + attention
         # Pre-Norm Feed Forward Network with Residual Connection
         out = h + self.mlp(self.post_attention_layernorm(h))
-        return out
+        return (out, cache) if use_cache else out

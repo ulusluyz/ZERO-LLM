@@ -1,14 +1,16 @@
 import torch
+import math
 import torch.nn.functional as F
 from typing import List, Optional
 from model import ZEROModel
-from tokenizer import Tokenizer
 
 
 def sample_top_k_top_p(logits: torch.Tensor, top_k: int = 0, top_p: float = 1.0, filter_value: float = -float("Inf")) -> torch.Tensor:
     """
     Filters a distribution of logits using top-k and/or nucleus (top-p) filtering.
     """
+    if not isinstance(top_k, int) or top_k < 0 or not 0 < top_p <= 1:
+        raise ValueError("top_k must be nonnegative and top_p must lie in (0, 1]")
     logits = logits.clone()
 
     # Top-K filtering
@@ -44,13 +46,28 @@ def generate_tokens(
     top_k: int = 0,
     top_p: float = 1.0,
     eos_id: Optional[int] = None,
-    device: torch.device = torch.device("cpu"),
+    device: Optional[torch.device] = None,
+    use_cache: bool = True,
 ) -> List[int]:
     """
     Generates tokens given a prompt token list.
     Supports greedy decoding, temperature sampling, top-k, and top-p (nucleus sampling).
     """
+    if not prompt_ids:
+        raise ValueError("Prompt must contain at least one token")
+    if not isinstance(max_new_tokens, int) or max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be nonnegative")
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError("temperature must be finite and nonnegative")
+    if not isinstance(top_k, int) or top_k < 0 or not 0 < top_p <= 1:
+        raise ValueError("Invalid sampling parameters")
+    if any(t < 0 or t >= model.config.vocab_size for t in prompt_ids):
+        raise ValueError("Prompt contains token IDs outside vocabulary")
+    if eos_id is not None and not 0 <= eos_id < model.config.vocab_size:
+        raise ValueError("Invalid EOS token ID")
     model.eval()
+    device = next(model.parameters()).device if device is None else device
+    cache = None
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
 
     for _ in range(max_new_tokens):
@@ -58,7 +75,14 @@ def generate_tokens(
         curr_input = input_ids[:, -model.config.max_seq_len :]
 
         # Forward pass to get logits for last token
-        logits = model(curr_input)
+        if use_cache:
+            # Rebuild at window rollover to match uncached sliding-window RoPE.
+            if cache is None or cache[0][0].size(2) >= model.config.max_seq_len:
+                logits, cache = model(curr_input, use_cache=True)
+            else:
+                logits, cache = model(input_ids[:, -1:], kv_cache=cache, use_cache=True)
+        else:
+            logits = model(curr_input)
         next_token_logits = logits[0, -1, :]
 
         if temperature == 0.0:

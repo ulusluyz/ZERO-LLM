@@ -53,7 +53,7 @@ def test_weight_tying():
     config.tie_embeddings = True
     model = ZEROModel(config)
 
-    assert torch.equal(model.lm_head.weight, model.tok_embeddings.embedding.weight)
+    assert model.lm_head.weight is model.tok_embeddings.embedding.weight
 
 
 def test_rmsnorm_forward():

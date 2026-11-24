@@ -1,5 +1,8 @@
 import json
-from typing import Dict, List, Tuple, Set, Optional
+import re
+import hashlib
+from collections import Counter
+from typing import Dict, List, Tuple, Optional
 
 
 def bytes_to_unicode() -> Dict[int, str]:
@@ -44,9 +47,14 @@ def merge(ids: List[int], pair: Tuple[int, int], idx: int) -> List[int]:
 
 
 class Tokenizer:
-    def __init__(self, special_tokens: Optional[List[str]] = None):
+    def __init__(self, special_tokens: Optional[List[str]] = None, pretokenize: bool = True):
         if special_tokens is None:
             special_tokens = ["<unk>", "<pad>", "<s>", "</s>"]
+        if any(not token for token in special_tokens) or len(set(special_tokens)) != len(special_tokens):
+            raise ValueError("Special tokens must be nonempty and unique")
+        if any(len(token.encode("utf-8")) == 1 for token in special_tokens):
+            raise ValueError("Special tokens cannot overlap single-byte tokens")
+        self.pretokenize = pretokenize
         self.special_tokens = special_tokens
 
         # Byte encoder and decoder
@@ -77,57 +85,79 @@ class Tokenizer:
     def vocab_size(self) -> int:
         return len(self.vocab)
 
-    def train(self, text: str, vocab_size: int, verbose: bool = False):
-        if vocab_size < self.vocab_size:
-            raise ValueError(f"Target vocab_size ({vocab_size}) must be >= initial size ({self.vocab_size})")
+    @property
+    def pad_id(self):
+        return self.special_id("<pad>")
 
-        num_merges = vocab_size - self.vocab_size
-        text_bytes = text.encode("utf-8")
-        byte_start_offset = len(self.special_tokens)
+    @property
+    def bos_id(self):
+        return self.special_id("<s>")
 
-        # Convert text bytes into list of initial byte token IDs
-        ids = [b + byte_start_offset for b in text_bytes]
+    @property
+    def eos_id(self):
+        return self.special_id("</s>")
 
-        for i in range(num_merges):
-            stats = get_stats(ids)
+    def special_id(self, token):
+        return self.special_tokens.index(token)
+
+    def _pieces(self, text):
+        return re.findall(r"\s+|[^\s]+", text) if self.pretokenize else [text]
+
+    def train(self, text: str, vocab_size: int, verbose: bool = False, min_frequency: int = 2):
+        if self.merges:
+            raise ValueError("Train a fresh tokenizer; retraining changes existing token IDs")
+        if vocab_size < self.vocab_size or min_frequency < 2:
+            raise ValueError("Invalid vocabulary size or minimum pair frequency")
+        # Count distinct pieces once; never merge across whitespace or special tokens.
+        chunks = Counter()
+        for special, part in self._parts(text):
+            if special:
+                continue
+            for piece in self._pieces(part):
+                chunks[tuple(b + len(self.special_tokens) for b in piece.encode("utf-8"))] += 1
+        for i in range(vocab_size - self.vocab_size):
+            stats = Counter()
+            for ids, frequency in chunks.items():
+                for pair, count in get_stats(ids).items():
+                    stats[pair] += count * frequency
             if not stats:
                 break
-            # Find pair with max frequency
-            best_pair = max(stats, key=stats.get)
+            best = max(stats, key=stats.get)
+            if stats[best] < min_frequency:
+                break
             idx = self.vocab_size
-
-            ids = merge(ids, best_pair, idx)
-            self.merges[best_pair] = idx
-
-            merged_bytes = self.vocab[best_pair[0]] + self.vocab[best_pair[1]]
-            self.vocab[idx] = merged_bytes
-            self.encoder[merged_bytes] = idx
-
+            updated = Counter()
+            for ids, frequency in chunks.items():
+                updated[tuple(merge(ids, best, idx))] += frequency
+            chunks = updated
+            self.merges[best] = idx
+            value = self.vocab[best[0]] + self.vocab[best[1]]
+            self.vocab[idx] = value
+            self.encoder[value] = idx
             if verbose:
-                print(f"Merge {i+1}/{num_merges}: {best_pair} -> {idx} ({merged_bytes})")
+                print(f"Merge {i + 1}: {best} -> {idx}")
+
+    def _parts(self, text):
+        if not self.special_tokens:
+            return [(False, text)]
+        pattern = "(" + "|".join(re.escape(t) for t in sorted(self.special_tokens, key=len, reverse=True)) + ")"
+        return [(part in self.special_tokens, part) for part in re.split(pattern, text) if part]
 
     def encode(self, text: str) -> List[int]:
-        if not text:
-            return []
-
-        # Handle special tokens directly if text is exactly a special token
-        if text in self.special_tokens:
-            return [self.encoder[text.encode("utf-8")]]
-
-        text_bytes = text.encode("utf-8")
-        byte_start_offset = len(self.special_tokens)
-        ids = [b + byte_start_offset for b in text_bytes]
-
-        while len(ids) >= 2:
-            stats = get_stats(ids)
-            # Find pair that was merged earliest
-            pair = min(stats, key=lambda p: self.merges.get(p, float("inf")))
-            if pair not in self.merges:
-                break
-            idx = self.merges[pair]
-            ids = merge(ids, pair, idx)
-
-        return ids
+        output = []
+        for special, part in self._parts(text):
+            if special:
+                output.append(self.special_id(part))
+                continue
+            for piece in self._pieces(part):
+                ids = [b + len(self.special_tokens) for b in piece.encode("utf-8")]
+                while len(ids) >= 2:
+                    pair = min(get_stats(ids), key=lambda p: self.merges.get(p, float("inf")))
+                    if pair not in self.merges:
+                        break
+                    ids = merge(ids, pair, self.merges[pair])
+                output.extend(ids)
+        return output
 
     def decode(self, ids: List[int]) -> str:
         byte_chunks = []
@@ -140,33 +170,46 @@ class Tokenizer:
         full_bytes = b"".join(byte_chunks)
         return full_bytes.decode("utf-8", errors="replace")
 
-    def save(self, filepath: str):
-        data = {
+    def to_dict(self):
+        return {
             "special_tokens": self.special_tokens,
-            "merges": [
-                [p[0], p[1], idx] for p, idx in self.merges.items()
-            ],
-            "vocab": {
-                str(k): list(v) for k, v in self.vocab.items()
-            }
+            "pretokenize": self.pretokenize,
+            "merges": [[a, b, idx] for (a, b), idx in self.merges.items()],
+            "vocab": {str(k): list(v) for k, v in self.vocab.items()},
         }
+
+    @property
+    def fingerprint(self):
+        data = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+    def save(self, filepath: str):
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
 
     @classmethod
-    def load(cls, filepath: str) -> "Tokenizer":
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        tok = cls(special_tokens=data["special_tokens"])
-
-        # Load vocab
+    def from_dict(cls, data):
+        # Old tokenizer files used whole-stream BPE.
+        tok = cls(data["special_tokens"], pretokenize=data.get("pretokenize", False))
         tok.vocab = {int(k): bytes(v) for k, v in data["vocab"].items()}
         tok.encoder = {v: k for k, v in tok.vocab.items()}
-
-        # Load merges
-        tok.merges = {
-            (m[0], m[1]): m[2] for m in data["merges"]
-        }
-
+        tok.merges = {(m[0], m[1]): m[2] for m in data["merges"]}
+        if set(tok.vocab) != set(range(len(tok.vocab))):
+            raise ValueError("Tokenizer vocabulary IDs must be contiguous")
+        for i, token in enumerate(tok.special_tokens):
+            if tok.vocab.get(i) != token.encode("utf-8"):
+                raise ValueError("Tokenizer special token IDs are invalid")
+        offset = len(tok.special_tokens)
+        if any(tok.vocab.get(offset + b) != bytes([b]) for b in range(256)):
+            raise ValueError("Tokenizer byte vocabulary is invalid")
+        for (a, b), idx in tok.merges.items():
+            if not (offset <= a < idx and offset <= b < idx and idx in tok.vocab):
+                raise ValueError("Invalid BPE merge IDs")
+            if tok.vocab[idx] != tok.vocab[a] + tok.vocab[b]:
+                raise ValueError("Invalid BPE merge bytes")
         return tok
+
+    @classmethod
+    def load(cls, filepath: str):
+        with open(filepath, "r", encoding="utf-8") as f:
+            return cls.from_dict(json.load(f))

@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from typing import Tuple
@@ -6,6 +7,8 @@ from typing import Tuple
 class RoPE(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 2048, theta: float = 10000.0):
         super().__init__()
+        if dim <= 0 or dim % 2 or max_seq_len <= 0 or not math.isfinite(theta) or not theta > 0:
+            raise ValueError("RoPE requires even positive dim, positive length and theta")
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.theta = theta
@@ -22,6 +25,8 @@ class RoPE(nn.Module):
         x shape: (batch, seq_len, num_heads, head_dim)
         """
         seq_len = x.size(1)
+        if x.size(-1) != self.dim or start_pos < 0 or start_pos + seq_len > self.max_seq_len:
+            raise ValueError("RoPE dimension or position exceeds configured bounds")
         freqs_cis = self.freqs_cis[start_pos : start_pos + seq_len]
 
         # Reshape x to complex numbers

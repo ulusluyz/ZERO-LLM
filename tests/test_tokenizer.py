@@ -30,8 +30,8 @@ def test_bpe_training_and_merges():
     target_vocab_size = initial_vocab_size + 10
 
     tok.train(text, vocab_size=target_vocab_size)
-    assert tok.vocab_size == target_vocab_size
-    assert len(tok.merges) == 10
+    assert initial_vocab_size < tok.vocab_size <= target_vocab_size
+    assert len(tok.merges) == tok.vocab_size - initial_vocab_size
 
     encoded = tok.encode("aaabbbccc")
     decoded = tok.decode(encoded)

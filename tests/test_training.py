@@ -67,6 +67,8 @@ def test_checkpoint_save_and_reload():
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+        if os.path.exists(tmp_path + ".sha256"):
+            os.remove(tmp_path + ".sha256")
 
 
 def test_text_dataset_creation():
